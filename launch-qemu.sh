@@ -16,7 +16,7 @@ SEV_SNP="0"
 ALLOW_DEBUG="0"
 USE_GDB="0"
 
-EXEC_PATH="/usr/local"
+EXEC_PATH="$PREFIX/usr/local"
 UEFI_PATH="$EXEC_PATH/share/qemu"
 
 usage() {
@@ -234,7 +234,9 @@ fi
 QEMU_CMDLINE=/tmp/cmdline.$$
 rm -rf $QEMU_CMDLINE
 
-add_opts "taskset --cpu-list 4 $QEMU_EXE"
+add_opts "taskset --cpu-list 2 $QEMU_EXE"
+
+add_opts "-s"
 
 #add_opts "-device vfio-pci,host=00:01.0,id=net10"
 
@@ -242,7 +244,7 @@ add_opts "taskset --cpu-list 4 $QEMU_EXE"
 add_opts "-enable-kvm -cpu EPYC-v4 -machine q35"
 
 # add number of VCPUs
-[ -n "${SMP}" ] && add_opts "-smp ${SMP},maxcpus=4"
+[ -n "${SMP}" ] && add_opts "-smp ${SMP},maxcpus=1"
 
 # define guest memory
 add_opts "-m ${MEM}M,slots=5,maxmem=30G"
@@ -298,7 +300,11 @@ if [ ${SEV} = "1" ]; then
 	add_opts "-machine memory-encryption=sev0,vmport=off" 
 	get_cbitpos
 
-	if [ "${ALLOW_DEBUG}" = "1" -o "${SEV_ES}" = 1 ]; then
+	if [ "${ALLOW_DEBUG}" = 1 -a "${SEV_SNP}" = 1 ]; then
+		POLICY=$(((1<<17)|(1<<16))) # smt enable
+		[ "${ALLOW_DEBUG}" = "1" ] && POLICY=$((POLICY | (1<<19)))
+		SNP_POLICY=$(printf ",policy=%#x" $POLICY)
+	elif [ "${ALLOW_DEBUG}" = "1" -o "${SEV_ES}" = "1" ]; then
 		POLICY=$((0x01))
 		[ "${ALLOW_DEBUG}" = "1" ] && POLICY=$((POLICY & ~0x01))
 		[ "${SEV_ES}" = "1" ] && POLICY=$((POLICY | 0x04))
@@ -306,7 +312,7 @@ if [ ${SEV} = "1" ]; then
 	fi
 
 	if [ "${SEV_SNP}" = 1 ]; then
-		add_opts "-object sev-snp-guest,id=sev0,cbitpos=${CBITPOS},reduced-phys-bits=1"
+		add_opts "-object sev-snp-guest,id=sev0${SNP_POLICY},cbitpos=${CBITPOS},reduced-phys-bits=1"
 	else
 		add_opts "-object sev-guest,id=sev0${SEV_POLICY},cbitpos=${CBITPOS},reduced-phys-bits=1"
 	fi
