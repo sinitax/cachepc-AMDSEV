@@ -244,7 +244,7 @@ add_opts "-s"
 add_opts "-enable-kvm -cpu EPYC-v4 -machine q35"
 
 # add number of VCPUs
-[ -n "${SMP}" ] && add_opts "-smp ${SMP},maxcpus=1"
+[ -n "${SMP}" ] && add_opts "-smp ${SMP},maxcpus=8"
 
 # define guest memory
 add_opts "-m ${MEM}M,slots=5,maxmem=30G"
