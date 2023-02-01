@@ -16,7 +16,7 @@ SEV_SNP="0"
 ALLOW_DEBUG="0"
 USE_GDB="0"
 
-EXEC_PATH="./usr/local"
+EXEC_PATH="/usr/local"
 UEFI_PATH="$EXEC_PATH/share/qemu"
 
 usage() {
@@ -29,6 +29,7 @@ usage() {
 	echo " -hda PATH          hard disk file (default $HDA)"
 	echo " -mem MEM           guest memory size in MB (default $MEM)"
 	echo " -smp NCPUS         number of virtual cpus (default $SMP)"
+	echo " -cdrom             CDROM image"
 	echo " -allow-debug       dump vmcb on exit and enable the trace"
 	exit 1
 }
@@ -38,6 +39,7 @@ add_opts() {
 }
 
 exit_from_int() {
+	stop_network
 	rm -rf ${QEMU_CMDLINE}
 	# restore the mapping
 	stty intr ^c
@@ -92,10 +94,22 @@ while [ -n "$1" ]; do
 		-hda) 		HDA="$2"
 				shift
 				;;
+		-cdrom)		CDROM_FILE="$2"
+				shift
+				;;
 		-mem)  		MEM="$2"
 				shift
 				;;
 		-smp)		SMP="$2"
+				shift
+				;;
+		-vnc)		VNC="$2"
+				shift
+				if [ "$VNC" = "" ]; then
+					usage
+				fi
+				;;
+		-console)	CONSOLE="$2"
 				shift
 				;;
 		-bios)          UEFI_PATH="$2"
@@ -103,13 +117,18 @@ while [ -n "$1" ]; do
 				;;
 		-allow-debug)   ALLOW_DEBUG="1"
 				;;
+		-novirtio)      USE_VIRTIO="0"
+				;;
 		-kernel)	KERNEL_FILE=$2
 				shift
 				;;
 		-initrd)	INITRD_FILE=$2
 				shift
 				;;
-		*) 		usage
+		-append) 	APPEND="$2"
+				shift
+				;;
+		*) 		echo "Calling usage, cannot understand argument $1"; usage
 				;;
 	esac
 
@@ -132,6 +151,51 @@ QEMU_EXE="$(readlink -e $TMP)"
 	}
 
 	GUEST_NAME="$(basename $TMP | sed -re 's|\.[^\.]+$||')"
+}
+
+[ -n "$CDROM_FILE" ] && {
+	TMP="$CDROM_FILE"
+	CDROM_FILE="$(readlink -e $TMP)"
+	[ -z "$CDROM_FILE" ] && {
+		echo "Can't locate CD-Rom file [$TMP]"
+		usage
+	}
+
+	[ -z "$GUEST_NAME" ] && GUEST_NAME="$(basename $TMP | sed -re 's|\.[^\.]+$||')"
+}
+
+setup_bridge_network() {
+	BRIDGE_DEV="virbr0"
+	# Get last tap device on host
+	TAP_NUM=`ifconfig | grep tap | tail -1 | cut -c4- | cut -f1 -d ' ' | cut -f1 -d:`
+	if [ "$TAP_NUM" = "" ]; then
+		TAP_NUM="1"
+	fi
+	TAP_NUM=`echo $(( TAP_NUM + 1 ))`
+	GUEST_TAP_NAME="tap${TAP_NUM}"
+
+	[ "$USE_VIRTIO" = "1" ] && PREFIX="52:54:00" || PREFIX="02:16:1e"
+	SUFFIX="$(ip address show dev ${BRIDGE_DEV} | grep link/ether | awk '{print $2}' | awk -F : '{print $4 ":" $5}')"
+	GUEST_MAC_ADDR="$(printf "%s:%s:%02x" $PREFIX $SUFFIX $TAP_NUM)"
+
+	echo "Starting network adapter '${GUEST_TAP_NAME}' MAC=$GUEST_MAC_ADDR"
+	run_cmd "ip tuntap add $GUEST_TAP_NAME mode tap user `whoami`"
+	run_cmd "ip link set $GUEST_TAP_NAME up"
+	run_cmd "ip link set $GUEST_TAP_NAME master ${BRIDGE_DEV}"
+
+	if [ "$USE_VIRTIO" = "1" ]; then
+		add_opts "-netdev type=tap,script=no,downscript=no,id=net0,ifname=$GUEST_TAP_NAME"
+		add_opts "-device virtio-net-pci,mac=${GUEST_MAC_ADDR},netdev=net0,disable-legacy=on,iommu_platform=true,romfile="
+	else
+		add_opts "-netdev tap,id=net0,ifname=$GUEST_TAP_NAME,script=no,downscript=no"
+		add_opts "-device e1000,mac=${GUEST_MAC_ADDR},netdev=net0,romfile="
+	fi
+}
+stop_network() {
+	if [ "$GUEST_TAP_NAME" = "" ]; then
+		return
+	fi
+	run_cmd "ip tuntap del ${GUEST_TAP_NAME} mode tap"
 }
 
 TMP="$UEFI_PATH/OVMF_CODE.fd"
@@ -170,13 +234,15 @@ fi
 QEMU_CMDLINE=/tmp/cmdline.$$
 rm -rf $QEMU_CMDLINE
 
-add_opts "$QEMU_EXE"
+add_opts "taskset --cpu-list 4 $QEMU_EXE"
+
+#add_opts "-device vfio-pci,host=00:01.0,id=net10"
 
 # Basic virtual machine property
 add_opts "-enable-kvm -cpu EPYC-v4 -machine q35"
 
 # add number of VCPUs
-[ -n "${SMP}" ] && add_opts "-smp ${SMP},maxcpus=64"
+[ -n "${SMP}" ] && add_opts "-smp ${SMP},maxcpus=4"
 
 # define guest memory
 add_opts "-m ${MEM}M,slots=5,maxmem=30G"
@@ -190,11 +256,23 @@ add_opts "-no-reboot"
 add_opts "-drive if=pflash,format=raw,unit=0,file=${UEFI_CODE},readonly"
 add_opts "-drive if=pflash,format=raw,unit=1,file=${UEFI_VARS}"
 
+# add CDROM if specified
+[ -n "${CDROM_FILE}" ] && add_opts "-drive file=${CDROM_FILE},media=cdrom -boot d"
+
+# check if host has bridge network
+BR0_STATUS="$(ip link show virbr0 type bridge 2>/dev/null)"
+if [ -n "$BR0_STATUS" ]; then
+	setup_bridge_network
+else
+	# Louis: Added port forwarding
+	add_opts "-netdev user,id=vmnic,hostfwd=tcp::8000-:22 -device e1000,netdev=vmnic,romfile="
+fi
+
 # add network support and fwd port 22 to 8000
 # echo "guest port 22 is fwd to host 8000..."
-#add_opts "-netdev user,id=vmnic,hostfwd=tcp::8000-:22 -device e1000,netdev=vmnic,romfile="
-add_opts "-netdev user,id=vmnic"
-add_opts " -device virtio-net-pci,disable-legacy=on,iommu_platform=true,netdev=vmnic,romfile="
+# add_opts "-netdev user,id=vmnic,hostfwd=tcp::8000-:22 -device e1000,netdev=vmnic,romfile="
+# add_opts "-netdev user,id=vmnic"
+# add_opts " -device virtio-net-pci,disable-legacy=on,iommu_platform=true,netdev=vmnic,romfile="
 
 # If harddisk file is specified then add the HDD drive
 if [ -n "${HDA}" ]; then
@@ -237,8 +315,11 @@ fi
 # if -kernel arg is specified then use the kernel provided in command line for boot
 if [ "${KERNEL_FILE}" != "" ]; then
 	add_opts "-kernel $KERNEL_FILE"
-	add_opts "-append \"console=ttyS0 earlyprintk=serial root=/dev/sda2\""
+	#add_opts "-append \"console=ttyS0 earlyprintk=serial root=/dev/sda2\""
 	[ ! -z ${INITRD_FILE} ] && add_opts "-initrd ${INITRD_FILE}"
+	if [[ -n "${APPEND}" ]]; then
+		add_opts "-append \"${APPEND}\""
+	fi
 fi
 
 # if console is serial then disable graphical interface
@@ -247,6 +328,13 @@ if [ "${CONSOLE}" = "serial" ]; then
 else
 	add_opts "-vga ${CONSOLE}"
 fi
+
+
+
+
+# start vnc server
+[ -n "${VNC}" ] && add_opts "-vnc :${VNC}" && echo "Starting VNC on port ${VNC}"
+
 
 # start monitor on pty and named socket 'monitor'
 add_opts "-monitor pty -monitor unix:monitor,server,nowait"
@@ -274,3 +362,6 @@ bash ${QEMU_CMDLINE} 2>&1 | tee -a ${QEMU_CONSOLE_LOG}
 stty intr ^c
 
 rm -rf ${QEMU_CMDLINE}
+if [ -n "$BR0_STATUS" ]; then
+	stop_network
+fi

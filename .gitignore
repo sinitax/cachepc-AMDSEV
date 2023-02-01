@@ -1,2 +1,7 @@
 distros/ubuntu-18.04/src
 distros/fedora-28/src
+linux
+qemu
+ovmf
+snp-release-*
+usr
